@@ -6,24 +6,22 @@ A lightweight automation tool to create, update, and manage Confluence pages dir
 This tool streamlines Confluence documentation workflows by allowing quick content publishing, attachments upload, and page management — without needing to navigate the Confluence editor manually.
 
 
-Configure Confluence
+## 🛠️ How It Works
 
-Enter your Confluence URL, space key, and PAT.
+Pip install streamlit requests
+streamlit run confluence_uploader.py
 
-Prepare Content
-
-Add page title (optional).
-
-Paste content in Confluence XML storage format.
-
-Optionally set a parent page ID for hierarchy.
-
-Add Attachments (Optional)
-
-Upload relevant files to attach to the page.
-
-Publish Page
-
-Click Create Page & Upload Attachments.
-
-Monitor results in the Operation Logs section.
+1. **Configure Confluence**
+   - Enter your Confluence URL, space key, and PAT.
+   
+2. **Prepare Content**
+   - Add page title (optional).
+   - Paste content in Confluence XML storage format.
+   - Optionally set a parent page ID for hierarchy.
+   
+3. **Add Attachments (Optional)**
+   - Upload relevant files to attach to the page.
+   
+4. **Publish Page**
+   - Click **Create Page & Upload Attachments**.
+   - Monitor results in the **Operation Logs** section.
