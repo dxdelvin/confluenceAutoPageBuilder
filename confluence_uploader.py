@@ -1,391 +1,510 @@
+import streamlit as st
 import requests
 import os
-import xml.etree.ElementTree as ET
-from requests.auth import HTTPBasicAuth
-from dotenv import load_dotenv
-import argparse
-import mimetypes
-import glob
-import traceback
+import re
+from datetime import datetime
+import zipfile
+import io
 
-load_dotenv()
-
-CONFLUENCE_URL = "http://localhost:8090"
-CONFLUENCE_USERNAME = os.getenv("CONFLUENCE_USERNAME")
-CONFLUENCE_PASSWORD = os.getenv("CONFLUENCE_PASSWORD")
-AUTH = HTTPBasicAuth(CONFLUENCE_USERNAME, CONFLUENCE_PASSWORD)
-API_BASE = f"{CONFLUENCE_URL}/rest/api"
-DEFAULT_JSON_HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
+DEFAULT_CONFLUENCE_URL = "https://confluence.bsh-group.com/"
 
 
-def parse_xml(xml_file_path):
-    print(f"\n--- Starting XML Parsing: {xml_file_path} ---")
-    try:
-        tree = ET.parse(xml_file_path)
-    except FileNotFoundError:
-        print(f"Error: XML file not found at {xml_file_path}")
-        return []
-    except ET.ParseError as e:
-        print(f"Error: Could not parse XML file {xml_file_path}. Error: {e}")
-        return []
-    root = tree.getroot()
+DEFAULT_SPACE_KEY = ""
+FALLBACK_PAGE_TITLE_BASE = "Automated Page FallBack Title"
 
-    body_content_map = {}
-    attachment_details_map = {}
+st.set_page_config(page_title="Docupedia Page Publisher", layout="wide")
+st.title("Docupedia Page Publishing Tool")
 
-    print("\n[XML PARSE - PASS 1] Indexing BodyContent objects...")
-    for obj in root.findall('object[@class="BodyContent"]'):
-        body_content_id_elem = obj.find('id')
-        body_prop_elem = obj.find('property[@name="body"]')
-        if body_content_id_elem and body_prop_elem is not None:
-            body_content_map[body_content_id_elem.text] = body_prop_elem.text if body_prop_elem.text is not None else ""
-    print(f"Found {len(body_content_map)} BodyContent objects.")
+# --- Initialize Session State ---
+if 'page_id' not in st.session_state:
+    st.session_state.page_id = None
+if 'current_page_version' not in st.session_state:
+    st.session_state.current_page_version = None
+if 'current_page_title' not in st.session_state:
+    st.session_state.current_page_title = None
+if 'page_link' not in st.session_state:
+    st.session_state.page_link = None
+if 'logs' not in st.session_state:
+    st.session_state.logs = []
 
-    print("\n[XML PARSE - PASS 2] Indexing Attachment objects...")
-    for obj in root.findall('object[@class="Attachment"]'):
-        attachment_id_elem = obj.find('id')
-        file_name_elem = obj.find('property[@name="fileName"]')
-        # This 'container' is the Page/BlogPost the attachment originally belonged to
-        container_ref_elem = obj.find('reference[@name="container"]/id')
-        original_container_id = container_ref_elem.text if container_ref_elem is not None else None
-
-        attachment_id_text = attachment_id_elem.text if attachment_id_elem is not None else "N/A_ID"
-        file_name_text = file_name_elem.text if file_name_elem is not None and file_name_elem.text is not None else "N/A_FILENAME"
-
-        print(
-            f"  DEBUG Attachment Index: XML_Attachment_ObjID='{attachment_id_text}', XML_FileName='{file_name_text}', XML_OriginalContainerID='{original_container_id}'")
-
-        if attachment_id_elem and file_name_elem is not None and file_name_elem.text:
-            attachment_id = attachment_id_elem.text
-            if original_container_id is None:
-                print(
-                    f"    CRITICAL WARNING: Attachment ObjID='{attachment_id}', FileName='{file_name_elem.text}' has NO 'original_container_id' in its XML <reference name='container'>. Path finding will likely FAIL for this attachment.")
-
-            attachment_details_map[attachment_id] = {
-                'original_id': attachment_id,
-                'fileName': file_name_elem.text,
-                'original_container_id': original_container_id
-            }
-        elif attachment_id_elem:
-            print(
-                f"    WARNING: Attachment object with XML_ID {attachment_id_elem.text} is missing 'fileName' property or fileName is empty. Skipping.")
-    print(f"Indexed {len(attachment_details_map)} Attachment objects with details.")
-
-    processed_content_items = []
-    content_ids_processed = set()
-    print("\n[XML PARSE - PASS 3] Processing Page, BlogPost, and CustomContentEntityObject objects...")
-    for obj in root.findall('object'):
-        class_name = obj.get('class')
-        if class_name not in ['Page', 'BlogPost', 'CustomContentEntityObject']:
-            continue
-
-        content_id_elem = obj.find('id')
-        if not content_id_elem or not content_id_elem.text:
-            continue
-        original_content_id = content_id_elem.text
-        if original_content_id in content_ids_processed:
-            continue
-
-        status_elem = obj.find('property[@name="contentStatus"]')
-        status = status_elem.text if status_elem and status_elem.text else 'current'
-
-        if status == 'current':
-            title_elem = obj.find('property[@name="title"]')
-            if not title_elem or not title_elem.text:
-                continue
-
-            content_ids_processed.add(original_content_id)
-            version_elem = obj.find('property[@name="version"]')
-            original_parent_id_elem = obj.find('reference[@name="parent"]/id')  # For Pages
-            original_parent_id = original_parent_id_elem.text if original_parent_id_elem is not None else None
-
-            if class_name == 'Page':
-                print(
-                    f"  DEBUG Page Parse: Title='{title_elem.text}' (XML_ID: {original_content_id}). XML_ParentPageID: {original_parent_id}")
-
-            api_type = "page"
-            if class_name == 'BlogPost': api_type = "blogpost"
-
-            is_internal_custom_content = obj.find('property[@name="pluginModuleKey"]') is not None and \
-                                         obj.find(
-                                             'property[@name="pluginModuleKey"]').text == "com.atlassian.confluence.plugins.confluence-content-property-storage:content-property"
-
-            item_data = {
-                'original_id': original_content_id, 'api_type': api_type, 'title': title_elem.text,
-                'content': '<!-- Body content not found -->', 'attachments': [],
-                'version': int(version_elem.text) if version_elem and version_elem.text else 1,
-                'original_parent_id': original_parent_id,
-                'is_internal_custom_content': is_internal_custom_content
-            }
-
-            body_content_id_ref_elem = obj.find('.//collection[@name="bodyContents"]/element[@class="BodyContent"]/id')
-            if body_content_id_ref_elem and body_content_id_ref_elem.text in body_content_map:
-                item_data['content'] = body_content_map[body_content_id_ref_elem.text]
-
-            attachment_id_ref_elements = obj.findall(
-                './/collection[@name="attachments"]/element[@class="Attachment"]/id')
-            if attachment_id_ref_elements:
-                print(
-                    f"    DEBUG Content '{item_data['title']}' (XML_ID: {original_content_id}) lists {len(attachment_id_ref_elements)} attachment references in XML.")
-            for att_id_ref_elem in attachment_id_ref_elements:
-                att_id = att_id_ref_elem.text
-                if att_id in attachment_details_map:
-                    if attachment_details_map[att_id]['original_container_id'] != original_content_id:
-                        print(
-                            f"      WARNING: Attachment ObjID {att_id} is listed under ContentID {original_content_id}, "
-                            f"but its own indexed XML_OriginalContainerID is {attachment_details_map[att_id]['original_container_id']}. This is unusual. "
-                            f"Will use {original_content_id} for path finding if needed, but check XML consistency.")
-                    item_data['attachments'].append(attachment_details_map[att_id])
-                else:
-                    print(
-                        f"      WARNING: Attachment reference ID {att_id} for content '{item_data['title']}' not found in indexed attachment_details_map. Skipping this attachment reference.")
-            processed_content_items.append(item_data)
-
-    print(f"\nFound {len(processed_content_items)} current, titled content items for migration.")
-    print("--- Finished XML Parsing ---")
-    return processed_content_items
+# Tag Collector utility state
+if 'tag_collector_input' not in st.session_state:
+    st.session_state.tag_collector_input = ""
+if 'tag_collector_output' not in st.session_state:
+    st.session_state.tag_collector_output = ""
 
 
-def get_space_key_from_parent(parent_page_id):
-    if not parent_page_id: return None
-    url = f"{API_BASE}/content/{parent_page_id}?expand=space"
-    print(f"Fetching space key for CLI parent page ID: {parent_page_id}")
-    try:
-        response = requests.get(url, headers=DEFAULT_JSON_HEADERS, auth=AUTH)
-        response.raise_for_status()
-        space_data = response.json().get('space')
-        if space_data and 'key' in space_data:
-            print(f"  Target space key: {space_data['key']}")
-            return space_data['key']
-        print(f"  Error: Could not find space key for parent ID {parent_page_id}. Response: {response.json()}")
-    except requests.exceptions.RequestException as e:
-        print(f"  Error fetching space key: {e}")
-    return None
+# --- Logging Helper ---
+def add_log(message):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state.logs.append(f"[{timestamp}] {message}")
 
 
-def create_content_in_confluence(item_data, space_key, effective_target_parent_id=None):
-    url = f"{API_BASE}/content"
-    payload = {
-        "type": item_data['api_type'], "title": item_data['title'],
-        "space": {"key": space_key},
-        "body": {"storage": {"value": item_data['content'], "representation": "storage"}}
-    }
-    if item_data['api_type'] == "page" and effective_target_parent_id:
-        payload["ancestors"] = [{"id": effective_target_parent_id}]
+# --- Sidebar ---
+with st.sidebar:
+    st.header("Configuration")
+    CONFLUENCE_URL = st.text_input(
+        "Confluence URL",
+        DEFAULT_CONFLUENCE_URL,
+        key="conf_url_input_sidebar"
+    )
+    SPACE_KEY = st.text_input(
+        "Space Key",
+        DEFAULT_SPACE_KEY,
+        key="space_key_input_sidebar"
+    )
+    CONFLUENCE_PAT = st.text_input(
+        "Confluence PAT",
+        type="password",
+        help="Your Confluence Personal Access Token.",
+        key="pat_input_sidebar"
+    )
 
-    parent_info = f" under TARGET parent ID '{effective_target_parent_id}'" if item_data[
-                                                                                   'api_type'] == "page" and effective_target_parent_id else " (as top-level in target hierarchy or blog post)"
-    print(f"  Attempting to create {item_data['api_type']}: '{item_data['title']}' in space '{space_key}'{parent_info}")
+    st.markdown("---")
 
-    try:
-        response = requests.post(url, json=payload, headers=DEFAULT_JSON_HEADERS, auth=AUTH)
-        if response.status_code == 400 and "A page with this title already exists" in response.text:
-            print(
-                f"    WARNING: Content '{item_data['title']}' may already exist. Skipping creation. Check Confluence. Response: {response.text[:200]}")
-            return None
-        response.raise_for_status()
-        new_id = response.json()['id']
-        print(f"    SUCCESS: Created {item_data['api_type']} '{item_data['title']}', New Confluence ID: {new_id}")
-        return new_id
-    except requests.exceptions.HTTPError as e:
-        print(
-            f"    HTTP ERROR creating content '{item_data['title']}': {e.response.status_code if e.response else 'N/A'}")
-        if e.response is not None: print(f"    Response: {e.response.text}")
-        raise
-    except Exception as e:
-        print(f"    UNEXPECTED ERROR creating content '{item_data['title']}': {e}")
-        traceback.print_exc()
-        raise
+    st.header("Tags Collector!")
 
+    current_tag_input = st.session_state.get('tag_collector_input', "")
+    st.session_state.tag_collector_input = st.text_input(
+        "Enter string to process:",
+        value=current_tag_input,  # Persist input using session state
+        key="tag_collector_raw_input_sidebar"  # Unique key for this widget
+    )
 
-def list_dirs(path, indent="        "):
-    """Helper to list directory contents for debugging attachment paths."""
-    print(f"{indent}Attempting to list contents of: {path}")
-    if not os.path.isdir(path):
-        print(f"{indent}  Path does not exist or is not a directory.")
-        return
-    try:
-        contents = os.listdir(path)
-        if not contents:
-            print(f"{indent}  Directory is empty.")
-        else:
-            print(f"{indent}  Contents:")
-            for item in contents[:10]:  # Print first 10 items
-                print(f"{indent}    - {item}")
-            if len(contents) > 10:
-                print(f"{indent}    ... and {len(contents) - 10} more items.")
-    except OSError as e:
-        print(f"{indent}  Error listing directory: {e}")
+    if st.session_state.tag_collector_input:
+        # Process the input string
+        processed_string = st.session_state.tag_collector_input.replace("Delete Label", " ")
+        st.session_state.tag_collector_output = ' '.join(processed_string.split())  # Remove extra spaces
 
-
-def find_attachment_file_on_disk(attachments_export_dir, attachment_object_id, original_filename,
-                                 original_container_page_id):
-    print(
-        f"    DEBUG AttachmentPath: Locating file for XML_AttachObjID='{attachment_object_id}', FileName='{original_filename}', LinkedTo_XML_PageID='{original_container_page_id}'")
-
-    if not original_container_page_id:
-        print(
-            f"      CRITICAL ERROR: LinkedTo_XML_PageID is missing for attachment '{original_filename}'. Cannot determine attachment directory path. Skipping this attachment.")
-        return None
-
-    page_attachment_dir = os.path.join(attachments_export_dir, str(original_container_page_id))
-    attachment_object_dir_base = os.path.join(page_attachment_dir, str(attachment_object_id))
-
-    paths_to_try = []
-    paths_to_try.append(os.path.join(attachment_object_dir_base, original_filename))
-
-    version_dir_glob_pattern = os.path.join(attachment_object_dir_base, "*", original_filename)
-
-    for p_idx, path_candidate in enumerate(paths_to_try):
-        print(f"      Attempting path {p_idx + 1} (direct): {path_candidate}")
-        if os.path.isfile(path_candidate):
-            print(f"        FOUND file at: {path_candidate}")
-            return path_candidate
-
-    print(f"      Attempting path with version glob: {version_dir_glob_pattern}")
-    glob_matches = glob.glob(version_dir_glob_pattern)
-    if glob_matches:
-        glob_matches.sort(key=lambda x: os.path.basename(os.path.dirname(x)),
-                          reverse=True)  # Try to get latest version by dirname
-        print(f"        FOUND {len(glob_matches)} match(es) via glob. Using: {glob_matches[0]}")
-        return glob_matches[0]
-
-    print(
-        f"      WARNING: Attachment file '{original_filename}' (XML_AttachObjID: {attachment_object_id}) for XML_PageID {original_container_page_id} NOT FOUND.")
-    print(f"      Expected Page Attachment Dir (should exist): {page_attachment_dir}")
-    list_dirs(page_attachment_dir)
-    print(f"      Expected Attachment Object Dir (should exist under page dir): {attachment_object_dir_base}")
-    list_dirs(attachment_object_dir_base)
-
-    return None
-
-
-def upload_attachments_to_content(newly_created_content_id, attachments_data_for_item, attachments_export_dir):
-    if not attachments_data_for_item:        return
-    print(
-        f"  Processing {len(attachments_data_for_item)} attachments for new Confluence Content ID {newly_created_content_id}...")
-    for att_data in attachments_data_for_item:
-        xml_attachment_object_id = att_data['original_id']
-        xml_filename = att_data['fileName']
-        xml_original_container_page_id = att_data.get('original_container_id')
-
-        print(
-            f"    Trying to find & upload: XML_Attachment_ObjID='{xml_attachment_object_id}', FileName='{xml_filename}', OriginallyOn_XML_PageID='{xml_original_container_page_id}'")
-
-        file_path_on_disk = find_attachment_file_on_disk(
-            attachments_export_dir, xml_attachment_object_id, xml_filename, xml_original_container_page_id
+        st.write("Processed string:")
+        st.markdown(
+            """
+            <div style="margin-top:10px; margin-bottom:20px;">
+            """, unsafe_allow_html=True
         )
-        if not file_path_on_disk: continue
+        st.code(st.session_state.tag_collector_output, language=None)  # Display processed string
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        upload_url = f"{API_BASE}/content/{newly_created_content_id}/child/attachment"
-        upload_headers = {"X-Atlassian-Token": "nocheck", "Accept": "application/json"}
-        content_type, _ = mimetypes.guess_type(xml_filename);
-        content_type = content_type or 'application/octet-stream'
+    elif not st.session_state.tag_collector_input and st.session_state.get('tag_collector_output'):
+        st.session_state.tag_collector_output = ""
 
-        try:
-            with open(file_path_on_disk, 'rb') as f_attach:
-                files_payload = {'file': (xml_filename, f_attach, content_type)}
-                print(f"      Uploading '{xml_filename}' from local: '{file_path_on_disk}'")
-                response = requests.post(upload_url, headers=upload_headers, auth=AUTH, files=files_payload)
-            if 200 <= response.status_code < 300:
-                new_aid = "N/A";
-                try:
-                    new_aid = response.json().get('results', [{}])[0].get('id', 'N/A')
-                except:
-                    pass
-                print(f"        SUCCESS: Uploaded '{xml_filename}' (New Confluence Attach ID: {new_aid})")
+    if not st.session_state.get('tag_collector_input') and not st.session_state.get('tag_collector_output'):
+        st.caption("Type above to see processed output.")
+
+API_BASE_URL = f"{CONFLUENCE_URL.rstrip('/')}/rest/api" if CONFLUENCE_URL else None
+HEADERS_CONTENT = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "Authorization": f"Bearer {CONFLUENCE_PAT}"
+}
+HEADERS_ATTACHMENT = {
+    "Accept": "application/json",
+    "X-Atlassian-Token": "nocheck",
+    "Authorization": f"Bearer {CONFLUENCE_PAT}"
+}
+
+
+st.header("1. Page Content & Location")
+col1, col2 = st.columns(2)
+with col1:
+    desired_page_title_from_input = st.text_input(
+        "Page Title for Confluence (Optional)",
+        FALLBACK_PAGE_TITLE_BASE,
+        help="The title you want for the Confluence page. A temporary suffix may be added if Title already Exists."
+             " You can Change it Later"
+    )
+with col2:
+    initial_parent_id_input = st.text_input(
+        "Parent Page ID (Optional)",
+        help="If provided, the new page will be created under this parent. You can Change it Later"
+    )
+
+storage_content_input = st.text_area(
+    "Paste Confluence Storage Format XML Here",
+    height=250,
+    placeholder="<p>Your content here...</p><p><ri:attachment ri:filename=\"example.png\" /></p>"
+)
+storage_content = storage_content_input if storage_content_input.strip() else None
+
+if not storage_content:
+    st.info("Paste your Confluence storage format XML into the text area above to begin.")
+
+st.header("2. Attachments (Optional)")
+uploaded_files_list = st.file_uploader(
+    "Upload attachments: ZIP file(s) or individual files (images, docs, etc.)",
+    type=['zip', 'png', 'jpg', 'jpeg', 'gif', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'svg'],
+    accept_multiple_files=True
+)
+
+referenced_attachments = []
+if storage_content:
+    try:
+        referenced_attachments = re.findall(r'<ri:attachment[^>]*?ri:filename="([^"]+)"', storage_content)
+        #referenced_attachments = re.findall(r'<ri:attachment\s+ri:filename="([^"]+)"[^>]*?/>', storage_content)
+
+        referenced_attachments = list(set(referenced_attachments))
+        if referenced_attachments:
+            st.write("Attachments referenced in content (by `ri:filename`):", ", ".join(referenced_attachments))
+            if uploaded_files_list:
+                uploaded_filenames = [f.name for f in uploaded_files_list]
+                st.write(f"Uploaded file(s) for attachments: `{', '.join(uploaded_filenames)}`.")
             else:
-                print(
-                    f"        FAILED to upload '{xml_filename}'. Status: {response.status_code}, Response: {response.text[:300]}")
-        except Exception as e:
-            print(f"        ERROR during upload of '{xml_filename}': {e}");
-            traceback.print_exc()
-
-
-def main(export_root_dir, cli_target_parent_page_id_str):
-    if not CONFLUENCE_USERNAME or not CONFLUENCE_PASSWORD:
-        print("Error: Credentials not set.");
-        return
-
-    xml_file_path = os.path.join(export_root_dir, "entities.xml")
-    attachments_base_dir = os.path.join(export_root_dir, "attachments")
-    if not os.path.exists(xml_file_path): print(f"Error: entities.xml not found in: '{export_root_dir}'"); return
-    attachments_dir_exists = os.path.isdir(attachments_base_dir)
-    if not attachments_dir_exists: print(
-        f"Warning: Attachments dir '{attachments_base_dir}' not found. Will not upload attachments.")
-
-    target_space_key = get_space_key_from_parent(cli_target_parent_page_id_str)
-    if not target_space_key: print(
-        f"Error: No space key from CLI parent ID '{cli_target_parent_page_id_str}'. Aborting."); return
-
-    content_items_to_migrate = parse_xml(xml_file_path)
-    if not content_items_to_migrate: print("No content items to migrate."); return
-
-    print(
-        f"\n--- Starting Migration of {len(content_items_to_migrate)} Content Items to Space '{target_space_key}' ---")
-    original_xml_id_to_new_confluence_id_map = {}
-
-    for i, item_data in enumerate(content_items_to_migrate):
-        print(
-            f"\n--- Processing Item {i + 1}/{len(content_items_to_migrate)} (XML Type: {item_data['api_type'].upper()}) ---")
-        print(
-            f"Title: '{item_data['title']}' (XML_ID: {item_data['original_id']}, XML_ParentPageID: {item_data.get('original_parent_id', 'N/A')})")
-
-        effective_target_parent_id_in_confluence = None
-        if item_data['api_type'] == 'page':  # Only standard pages have explicit 'ancestors'
-            xml_parent_id_of_this_item = item_data.get('original_parent_id')
-
-            if xml_parent_id_of_this_item:
-                if xml_parent_id_of_this_item in original_xml_id_to_new_confluence_id_map:
-                    effective_target_parent_id_in_confluence = original_xml_id_to_new_confluence_id_map[
-                        xml_parent_id_of_this_item]
-                    print(
-                        f"  PARENTING: XML parent '{xml_parent_id_of_this_item}' was already created. New Target Parent Confluence ID: {effective_target_parent_id_in_confluence}")
-                else:
-                    effective_target_parent_id_in_confluence = cli_target_parent_page_id_str
-                    print(
-                        f"  PARENTING: XML parent '{xml_parent_id_of_this_item}' NOT YET PROCESSED in this run OR not a 'Page' type. Defaulting to CLI Parent ID: {effective_target_parent_id_in_confluence}")
-            else:
-                effective_target_parent_id_in_confluence = cli_target_parent_page_id_str
-                print(
-                    f"  PARENTING: Item is a TOP-LEVEL page from XML export. Target Parent is CLI Parent ID: {effective_target_parent_id_in_confluence}")
+                st.warning("Content references attachments, but no files have been uploaded yet for them.")
         else:
-            print(
-                f"  PARENTING: Item is '{item_data['api_type']}', does not use explicit Confluence parent page structure in the same way.")
-
-        if item_data['is_internal_custom_content']:
-            print(
-                f"  INFO: Item '{item_data['title']}' is internal custom content. Will be migrated as a standard page; may appear as raw data.")
-
-        try:
-            newly_created_confluence_id = create_content_in_confluence(
-                item_data, target_space_key, effective_target_parent_id_in_confluence
-            )
-            if newly_created_confluence_id:
-                original_xml_id_to_new_confluence_id_map[item_data['original_id']] = newly_created_confluence_id
-                if item_data['attachments'] and attachments_dir_exists:
-                    upload_attachments_to_content(newly_created_confluence_id, item_data['attachments'],
-                                                  attachments_base_dir)
-        except Exception:
-            print(f"  CRITICAL ERROR processing item '{item_data['title']}'. Details above. Item not fully migrated.")
+            st.info("No `<ri:attachment>` tags found in the provided storage content.")
+    except Exception as e:
+        st.error(f"Error parsing storage content for attachments: {e}")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Migrate Confluence content from XML export.",
-                                     formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("export_dir",
-                        help="Path to Confluence export directory (must contain entities.xml and attachments/).")
-    parser.add_argument("cli_parent_id",
-                        help="Numeric ID of the TARGET Confluence page (in http://localhost:8090) under which the TOP-LEVEL pages from the export will be created.")
-    args = parser.parse_args()
-
-    print(f"--- Confluence XML Migration Script ---")
-    print(f"Target Confluence URL: {CONFLUENCE_URL}")
-    print(f"Export Directory: {args.export_dir}")
-    print(f"CLI Target Parent Page ID (for top-level imported pages): {args.cli_parent_id}")
-
-    if not CONFLUENCE_USERNAME or not CONFLUENCE_PASSWORD:
-        print("\nERROR: CONFLUENCE_USERNAME or CONFLUENCE_PASSWORD not set in .env or environment variables.")
+def create_confluence_page_storage_api(title, space_key, storage_format_data, parent_id, headers, api_base_url,
+                                       log_func):
+    api_url = f"{api_base_url}/content"
+    page_data = {
+        "type": "page", "title": title, "space": {"key": space_key},
+        "body": {"storage": {"value": storage_format_data, "representation": "storage"}},
+    }
+    if parent_id:
+        page_data["ancestors"] = [{"id": str(parent_id)}]
+        log_func(f"Attempting to create page '{title}' in space '{space_key}' under parent ID '{parent_id}'...")
     else:
-        main(args.export_dir, args.cli_parent_id)
-    print(f"\n--- Migration Process Finished ---")
+        log_func(f"Attempting to create page '{title}' in space '{space_key}' (at space root)...")
+
+    try:
+        response = requests.post(api_url, headers=headers, json=page_data, timeout=30)
+        response.raise_for_status()
+        page_info = response.json()
+        page_id = page_info.get('id')
+        version_number = page_info.get('version', {}).get('number')
+        created_title = page_info.get('title')
+        web_ui_suffix = page_info.get('_links', {}).get('webui', '')
+        page_link_relative = web_ui_suffix if web_ui_suffix and web_ui_suffix.startswith(
+            '/') else f"/pages/viewpage.action?pageId={page_id}"
+        page_link_full = f"{CONFLUENCE_URL.rstrip('/')}{page_link_relative}"  # Uses CONFLUENCE_URL from sidebar
+        log_func(f"SUCCESS: Created page '{created_title}' (ID: {page_id}, Version: {version_number})")
+        return {"id": page_id, "link": page_link_full, "version": version_number, "title": created_title}
+    except requests.exceptions.HTTPError as e:
+        log_func(f"ERROR creating page: {e} (Status {e.response.status_code})")
+        try:
+            log_func(f"Response content: {e.response.text[:500]}...")
+        except Exception:
+            log_func("Could not decode error response content.")
+    except Exception as e:
+        log_func(f"Unexpected error in create_confluence_page_storage_api: {e}")
+    return None
+
+
+def upload_attachment_api(page_id, filename_on_confluence, file_bytes, headers, api_base_url, log_func):
+    api_url = f"{api_base_url}/content/{page_id}/child/attachment"
+    try:
+        files_for_requests = {'file': (filename_on_confluence, file_bytes, 'application/octet-stream')}
+        log_func(f"  Uploading as '{filename_on_confluence}' to page ID {page_id}...")
+        resp = requests.post(api_url, headers=headers, files=files_for_requests, timeout=60)
+        resp.raise_for_status()
+        log_func(f"  SUCCESS: Uploaded '{filename_on_confluence}'")
+        return True
+    except requests.exceptions.HTTPError as e:
+        log_func(f"  ERROR uploading '{filename_on_confluence}': {e} (Status {e.response.status_code})")
+        if e.response.status_code == 409:
+            log_func("  >>> Conflict: Attachment with this name might already exist on the page.")
+        elif e.response.status_code == 403:
+            log_func("  >>> Forbidden: Check PAT permissions for adding attachments.")
+        try:
+            log_func(f"  Response content: {e.response.text[:200]}...")
+        except Exception:
+            log_func("Could not decode error response content.")
+    except Exception as e:
+        log_func(f"  Unexpected error uploading '{filename_on_confluence}': {e}")
+    return False
+
+
+def move_confluence_page_api(page_id_to_move, current_page_title, space_key, new_parent_id, current_version, headers,
+                             api_base_url, log_func):
+    api_url = f"{api_base_url}/content/{page_id_to_move}"
+    next_version_number = current_version + 1
+    move_data = {
+        "id": page_id_to_move, "type": "page", "title": current_page_title,
+        "space": {"key": space_key}, "ancestors": [{"id": str(new_parent_id)}],
+        "version": {"number": next_version_number}
+    }
+    log_func(
+        f"Attempting to move page '{current_page_title}' (ID: {page_id_to_move}, Ver: {current_version}) under parent ID '{new_parent_id}'...")
+    try:
+        response = requests.put(api_url, headers=headers, json=move_data, timeout=30)
+        response.raise_for_status()
+        updated_page_info = response.json()
+        updated_version = updated_page_info.get('version', {}).get('number')
+        log_func(f"SUCCESS: Moved page. New Version: {updated_version}")
+        return True, updated_version
+    except requests.exceptions.HTTPError as e:
+        log_func(f"ERROR moving page: {e} (Status {e.response.status_code})")
+        try:
+            log_func(f"Response content: {e.response.text[:500]}...")
+        except Exception:
+            log_func("Could not decode error response content.")
+    except Exception as e:
+        log_func(f"Unexpected error in move_confluence_page_api: {e}")
+    return False, current_version
+
+
+def update_page_title_api(page_id_to_update, new_page_title, space_key, current_version, headers, api_base_url,
+                          log_func):
+    api_url = f"{api_base_url}/content/{page_id_to_update}"
+    next_version_number = current_version + 1
+    update_data = {
+        "id": page_id_to_update, "type": "page", "title": new_page_title,
+        "space": {"key": space_key}, "version": {"number": next_version_number}
+    }
+    log_func(
+        f"Attempting to update title of page ID '{page_id_to_update}' (Ver: {current_version}) to '{new_page_title}'...")
+    try:
+        response = requests.put(api_url, headers=headers, json=update_data, timeout=30)
+        response.raise_for_status()
+        updated_page_info = response.json()
+        confirmed_new_title = updated_page_info.get('title')
+        updated_version = updated_page_info.get('version', {}).get('number')
+        log_func(f"SUCCESS: Updated page title to '{confirmed_new_title}'. New Version: {updated_version}")
+        return True, updated_version, confirmed_new_title
+    except requests.exceptions.HTTPError as e:
+        log_func(f"ERROR updating page title: {e} (Status {e.response.status_code})")
+        if e.response and e.response.text:
+            error_detail = ""
+            try:
+                error_json = e.response.json()
+                error_detail = error_json.get('message', e.response.text[:500])
+            except requests.exceptions.JSONDecodeError:
+                error_detail = e.response.text[:500]
+            log_func(f"Response content: {error_detail}...")
+            if "title already exists" in error_detail.lower():
+                log_func("  >>> This often means the new title is already in use in this space.")
+        else:
+            log_func("Could not decode error response content or response was empty.")
+    except Exception as e:
+        log_func(f"Unexpected error in update_page_title_api: {e}")
+    return False, current_version, None
+
+
+st.header("3. Create Confluence Page")
+if st.button("🚀 Create Page & Upload Attachments",
+             disabled=not storage_content or not CONFLUENCE_PAT or not API_BASE_URL):
+    if not storage_content:
+        st.error("Please provide storage format XML in Step 1.")
+    elif not CONFLUENCE_PAT:
+        st.error("Please enter your Confluence PAT in the sidebar.")
+    elif not API_BASE_URL:
+        st.error("Confluence URL in sidebar is not valid or missing.")
+    else:
+        st.session_state.logs = []
+        add_log("Initiating page creation process...")
+
+        user_specified_title_base = desired_page_title_from_input.strip()
+        if not user_specified_title_base: user_specified_title_base = FALLBACK_PAGE_TITLE_BASE.strip()
+
+        # current_time_str_suffix = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        title_for_initial_creation = user_specified_title_base
+
+        add_log(f"Desired final page title: '{user_specified_title_base}'")
+        add_log(f"Desired title for initial creation: '{title_for_initial_creation}'")
+        parent_id_to_use = initial_parent_id_input.strip() if initial_parent_id_input else None
+
+        creation_info = None
+        with st.spinner(f"Creating page '{title_for_initial_creation}' on Confluence..."):
+            creation_info = create_confluence_page_storage_api(
+                title_for_initial_creation, SPACE_KEY, storage_content, parent_id_to_use,
+                HEADERS_CONTENT, API_BASE_URL, log_func=add_log
+            )
+
+        if creation_info:
+            st.session_state.page_id = creation_info["id"]
+            st.session_state.current_page_version = creation_info["version"]
+            st.session_state.current_page_title = creation_info["title"]
+            st.session_state.page_link = creation_info["link"]
+
+            if user_specified_title_base and user_specified_title_base != st.session_state.current_page_title:
+                add_log(f"Attempting to update page title to the desired base: '{user_specified_title_base}'...")
+                with st.spinner(f"Updating title to '{user_specified_title_base}'..."):
+                    title_update_success, new_ver_rename, conf_title = update_page_title_api(
+                        st.session_state.page_id, user_specified_title_base, SPACE_KEY,
+                        st.session_state.current_page_version, HEADERS_CONTENT, API_BASE_URL, log_func=add_log
+                    )
+                if title_update_success:
+                    st.session_state.current_page_version = new_ver_rename
+                    st.session_state.current_page_title = conf_title
+                    add_log(f"SUCCESS: Page title updated to '{st.session_state.current_page_title}'.")
+                else:
+                    add_log(
+                        f"WARNING: Failed to update page title to '{user_specified_title_base}'. The page retains the title '{st.session_state.current_page_title}'. This might be due to the desired title already existing in the space.")
+                    st.warning(
+                        f"Could not update title to '{user_specified_title_base}'. Page remains '{st.session_state.current_page_title}'. (Desired title might already exist).")
+
+            if referenced_attachments and uploaded_files_list:
+                add_log(f"\nProcessing attachments for page ID: {st.session_state.page_id}...")
+                succ_uploads = 0;
+                fail_uploads = 0
+                available_attachments_data = {}
+
+                with st.spinner("Preparing attachments from uploads..."):
+                    for uploaded_file in uploaded_files_list:
+                        original_filename = uploaded_file.name
+                        try:
+                            file_content_bytes = uploaded_file.getvalue()
+                            if original_filename.lower().endswith('.zip'):
+                                add_log(f"  Processing ZIP file: '{original_filename}'")
+                                try:
+                                    with zipfile.ZipFile(io.BytesIO(file_content_bytes), 'r') as zip_ref:
+                                        for name_in_zip in zip_ref.namelist():
+                                            if name_in_zip.endswith('/'): continue
+                                            base_name_in_zip = os.path.basename(name_in_zip)
+                                            try:
+                                                bytes_in_zip = zip_ref.read(name_in_zip)
+                                                if base_name_in_zip in available_attachments_data:
+                                                    add_log(
+                                                        f"    WARNING: Attachment '{base_name_in_zip}' from '{original_filename}' (path: '{name_in_zip}') overrides a previously found file.")
+                                                available_attachments_data[base_name_in_zip] = (
+                                                bytes_in_zip, f"{original_filename}/{name_in_zip}")
+                                                add_log(
+                                                    f"    Found '{base_name_in_zip}' (from '{name_in_zip}') in ZIP.")
+                                            except Exception as e_zip_read:
+                                                add_log(
+                                                    f"    ERROR reading '{name_in_zip}' from ZIP '{original_filename}': {e_zip_read}")
+                                except zipfile.BadZipFile:
+                                    add_log(
+                                        f"  ERROR: Uploaded file '{original_filename}' is not a valid ZIP file or is corrupted.")
+                                except Exception as e_zip_proc:
+                                    add_log(f"  ERROR processing ZIP file '{original_filename}': {e_zip_proc}")
+                            else:
+                                base_uploaded_filename = os.path.basename(original_filename)
+                                if base_uploaded_filename in available_attachments_data:
+                                    add_log(
+                                        f"  WARNING: Directly uploaded file '{base_uploaded_filename}' overrides a previously found file.")
+                                available_attachments_data[base_uploaded_filename] = (
+                                file_content_bytes, original_filename)
+                                add_log(f"  Prepared directly uploaded file: '{base_uploaded_filename}'")
+                        except Exception as e_file_proc:
+                            add_log(f"  ERROR processing uploaded file '{original_filename}': {e_file_proc}")
+
+                if available_attachments_data and referenced_attachments:
+                    add_log("Attempting to upload referenced attachments...")
+                    with st.spinner("Uploading attachments..."):
+                        for ref_fn_in_content in referenced_attachments:
+                            filename_on_confluence = os.path.basename(ref_fn_in_content)
+                            if filename_on_confluence in available_attachments_data:
+                                file_bytes, source_description = available_attachments_data[filename_on_confluence]
+                                add_log(f"  Match found for '{filename_on_confluence}' (from '{source_description}').")
+                                try:
+                                    if upload_attachment_api(st.session_state.page_id, filename_on_confluence,
+                                                             file_bytes, HEADERS_ATTACHMENT, API_BASE_URL,
+                                                             log_func=add_log):
+                                        succ_uploads += 1
+                                    else:
+                                        fail_uploads += 1
+                                except Exception as e_upload_call:
+                                    add_log(
+                                        f"  ERROR during upload_attachment_api call for '{filename_on_confluence}': {e_upload_call}");
+                                    fail_uploads += 1
+                            else:
+                                add_log(
+                                    f"  SKIPPING: Referenced attachment '{filename_on_confluence}' (from content: '{ref_fn_in_content}') not found in uploads.")
+                                fail_uploads += 1
+                elif referenced_attachments:
+                    add_log("No attachable files were processed from uploads, but content references attachments.")
+
+                add_log(f"Attachment upload summary: {succ_uploads} succeeded, {fail_uploads} failed/skipped.")
+                if succ_uploads > 0: st.info(f"{succ_uploads} attachments uploaded successfully.")
+                if fail_uploads > 0: st.warning(
+                    f"{fail_uploads} attachments failed to upload or were skipped. Check logs.")
+
+            elif referenced_attachments:
+                add_log("Content references attachments, but no files were provided for upload in Step 2.")
+                st.warning("Your content references attachments, but you didn't upload any files in Step 2.")
+
+            st.success(
+                f"Page '{st.session_state.current_page_title}' (ID: {st.session_state.page_id}, Ver: {st.session_state.current_page_version}) processed!")
+            st.markdown(f"🔗 **View page:** [{st.session_state.current_page_title}]({st.session_state.page_link})")
+        else:
+            st.error("Page creation failed. Check logs below for details.")
+            st.session_state.page_id = None
+
+if st.session_state.page_id:
+    st.markdown("---")
+    st.header(f"4. Manage Page: '{st.session_state.current_page_title}' (ID: {st.session_state.page_id})")
+
+    with st.expander("↪️ Move Page"):
+        new_parent_id_input_move = st.text_input("Enter Target Parent Page ID (for moving)",
+                                                 key="move_parent_id_input_main")
+        if st.button("Move Page", key="move_page_btn_main",
+                     disabled=not new_parent_id_input_move or not CONFLUENCE_PAT or not API_BASE_URL):
+            if not CONFLUENCE_PAT:
+                st.error("PAT missing in sidebar.")
+            elif not API_BASE_URL:
+                st.error("Confluence URL invalid/missing in sidebar.")
+            else:
+                with st.spinner(f"Moving page {st.session_state.page_id} under parent {new_parent_id_input_move}..."):
+                    success, new_version = move_confluence_page_api(
+                        st.session_state.page_id, st.session_state.current_page_title, SPACE_KEY,
+                        new_parent_id_input_move, st.session_state.current_page_version,
+                        HEADERS_CONTENT, API_BASE_URL, log_func=add_log
+                    )
+                if success:
+                    st.session_state.current_page_version = new_version
+                    st.success(f"Page moved successfully! New version: {new_version}.")
+                    add_log(f"SUCCESS: Page moved to be under parent {new_parent_id_input_move}.")
+                else:
+                    st.error("Page move failed. Check logs."); add_log("ERROR: Page move failed.")
+
+    with st.expander("✏️ Update Page Title"):
+        new_title_input_update = st.text_input("Enter New Title for the Page",
+                                               value=st.session_state.current_page_title, key="update_title_input_main")
+        if st.button("Update Title", key="update_title_btn_main",
+                     disabled=not new_title_input_update or new_title_input_update == st.session_state.current_page_title or not CONFLUENCE_PAT or not API_BASE_URL):
+            if not CONFLUENCE_PAT:
+                st.error("PAT missing in sidebar.")
+            elif not API_BASE_URL:
+                st.error("Confluence URL invalid/missing in sidebar.")
+            else:
+                with st.spinner(f"Updating title for page {st.session_state.page_id}..."):
+                    success, new_version, confirmed_title = update_page_title_api(
+                        st.session_state.page_id, new_title_input_update, SPACE_KEY,
+                        st.session_state.current_page_version, HEADERS_CONTENT, API_BASE_URL, log_func=add_log
+                    )
+                if success:
+                    st.session_state.current_page_version = new_version
+                    st.session_state.current_page_title = confirmed_title
+                    st.success(f"Page title updated to '{confirmed_title}'! New version: {new_version}.")
+                    add_log(f"SUCCESS: Page title updated to '{confirmed_title}'.")
+                    st.experimental_rerun()
+                else:
+                    st.error("Page title update failed. Check logs."); add_log("ERROR: Page title update failed.")
+
+    st.markdown(
+        f"**Current Page Status:** Title: `{st.session_state.current_page_title}`, ID: `{st.session_state.page_id}`, Version: `{st.session_state.current_page_version}`")
+    if st.session_state.page_link:
+        st.markdown(f"🔗 **Link:** [{st.session_state.current_page_title}]({st.session_state.page_link})")
+
+st.markdown("---")
+st.header("📜 Operation Logs")
+with st.expander("View Logs", expanded=True):
+    if st.session_state.logs:
+        st.markdown("""
+            <style>
+            .log-container {
+                max-height: 300px; 
+                overflow-y: auto;  
+                border: 1px solid #ddd;
+                padding: 10px;
+                border-radius: 5px;
+                font-family: monospace;
+                white-space: pre-wrap; 
+                word-wrap: break-word; 
+            }
+            </style>
+        """, unsafe_allow_html=True)
+
+        logs_html_content = "<div class='log-container'>"
+        for log_entry in reversed(st.session_state.logs):
+            safe_log_entry = log_entry.replace("&", "&").replace("<", "<").replace(">", ">")
+            logs_html_content += f"{safe_log_entry}<br>"
+        logs_html_content += "</div>"
+
+        st.markdown(logs_html_content, unsafe_allow_html=True)
+    else:
+        st.caption("No operations performed yet in this session.")
